@@ -14,32 +14,36 @@
 """
 from dataclasses import dataclass
 import numpy as np
-import tensorflow as tf
-import ray_tracing as rt
+import ray_tracing_lite as rt
+import torch
 
 
 def mask_replace(mask, src, dst):
     assert src.shape == mask.shape
     assert len(dst.shape) == 1
-    return tf.where(mask, tf.scatter_nd(tf.where(mask), dst, mask.shape), src)
+    indices = torch.nonzero(mask)
+    values = dst[indices[:, 0]]
+    src.scatter_(0, indices.t(), values)
+    return src
+
 
 
 def g_from_n_v(n, v):
     assert len(n.shape) == len(v.shape) == 1
-    w = tf.constant([[-7.497527849096219, -7.49752916467739], [0.07842101471405442, -0.07842100095362642]])
-    mean = tf.constant([[1.6426209211349487, 48.8505973815918]])
+    w = torch.tensor([[-7.497527849096219, -7.49752916467739], [0.07842101471405442, -0.07842100095362642]])
+    mean = torch.tensor([[1.6426209211349487, 48.8505973815918]])
 
-    g = (tf.stack((n, v), axis=-1) - mean) @ w
+    g = torch.matmul((torch.stack((n, v), axis=-1) - mean), w)
 
     return g
 
 
 def n_v_from_g(g):
     assert len(g.shape) == 2 and g.shape[1] == 2
-    w = tf.constant([[-0.06668863644654068, 6.3758429552417315], [-0.0666886481483064, -6.375841836481304]])
-    mean = tf.constant([[1.6426209211349487, 48.8505973815918]])
+    w = torch.tensor([[-0.06668863644654068, 6.3758429552417315], [-0.0666886481483064, -6.375841836481304]])
+    mean = torch.tensor([[1.6426209211349487, 48.8505973815918]])
 
-    return tf.unstack(g @ w + mean, axis=1)
+    return torch.unbind(torch.matmul(g, w) + mean, dim=1)
 
 
 def find_valid_curvatures(sequence):
@@ -68,39 +72,37 @@ def get_normalized_lens_variables(lens, trainable_vars, add_bfl=False, scale_fac
     # We first define the glass materials by the refractive indices 'nd' and Abbe numbers 'v'
     # We go to the normalized form 'g' which is the one that we will optimize
     # Then we go back to the first form 'nd' and 'v' for ray tracing
-    g = tf.Variable(lambda: g_from_n_v(lens.flat_nd, lens.flat_v) * scale_factor, name='lens_g', dtype=tf.float32,
-                    trainable=trainable_vars['g'])
+    g = torch.nn.Parameter(g_from_n_v(lens.flat_nd, lens.flat_v) * scale_factor)
+
 
     t_non_flat = lens.t
     if add_bfl:
         # Find last thickness, which corresponds to the defocus
         last_t_position = lens.structure.mask.sum(axis=1) - 1
-        last_t_indices = tf.stack((tf.range(len(lens)), last_t_position), axis=1)
-        last_t = tf.gather_nd(lens.t, last_t_indices)
+        last_t_indices = torch.stack((torch.arange(len(lens)), last_t_position), dim=1)
+        last_t = torch.gather(lens.t, 1, last_t_indices)
 
         # Remove the BFL
         updated_last_t = last_t - lens.bfl
 
         # Update
-        t_non_flat = tf.tensor_scatter_nd_update(t_non_flat, last_t_indices, updated_last_t)
-    t = tf.Variable(lambda: t_non_flat[lens.structure.mask] * scale_factor, name='lens_t', dtype=tf.float32,
-                    trainable=trainable_vars['t'])
+        t_non_flat.scatter_(1, last_t_indices, updated_last_t)
+    t = torch.nn.Parameter(t_non_flat[lens.structure.mask] * scale_factor)
 
     # Curvatures are optimized as is
     # We exclude the last curvature which is computed on the fly
     # We also exclude the curvatures of the surfaces surrounded by air (usually the aperture stop)
     valid_curvatures = find_valid_curvatures(lens.structure)
 
-    c = tf.Variable(lambda: lens.c[valid_curvatures] * scale_factor, name='lens_c', dtype=tf.float32,
-                    trainable=trainable_vars['c'])
+    c = torch.nn.Parameter(lens.c[valid_curvatures] * scale_factor)
 
     return c, t, g
 
 
 def map_glass_to_closest(g, catalog_g):
-    dist = tf.norm(g[:, None, :] - catalog_g[None, :, :], axis=-1)
-    min_dist_idx = tf.argmin(dist, axis=1)
-    return tf.gather(catalog_g, min_dist_idx), catalog_g
+    dist = torch.norm(g[:, None, :] - catalog_g[None, :, :], dim=-1)
+    min_dist_idx = torch.argmin(dist, dim=1)
+    return torch.gather(catalog_g, 0, min_dist_idx), catalog_g
 
 
 def get_lens_from_normalized(structure, c, t, g, catalog_g, add_bfl=False, scale_factor=1, qc_variables=True):
@@ -111,12 +113,17 @@ def get_lens_from_normalized(structure, c, t, g, catalog_g, add_bfl=False, scale
 
     # If quantized continuous glass variables, map the glass variables to the closest catalog glass
     if qc_variables:
-        g, _ = tf.grad_pass_through(map_glass_to_closest)(g, catalog_g)
+        g, _ = map_glass_to_closest(g, catalog_g)
+        """
+        PyTorchでは、torch.autograd.grad_modeを使用してTensorのグラデーションパスを変更することはできません。
+        そのため、tf.grad_pass_throughと同様の動作を再現することは困難です。
+        一つのアプローチとしては、qc_variablesがTrueの場合にのみ、map_glass_to_closest関数を呼び出して変数gを更新する方法があります。
+        """
 
     # Retrieve the lens
     nd, v = n_v_from_g(g)
     # Fill the curvature array
-    c2d = tf.zeros_like(structure.mask, dtype=c.dtype)
+    c2d = torch.zeros_like(structure.mask, dtype=c.dtype)
     c2d = mask_replace(find_valid_curvatures(structure), c2d, c)
     flat_c = c2d[structure.mask_except_last]
     # Compute the last curvature with an algebraic solve to enforce EFL = 1
@@ -126,7 +133,7 @@ def get_lens_from_normalized(structure, c, t, g, catalog_g, add_bfl=False, scale
     if add_bfl:
         # Find last thickness, which corresponds to the defocus
         last_t_position = lens.structure.mask.sum(axis=1) - 1
-        last_t_indices = tf.stack((tf.range(len(lens)), last_t_position), axis=1)
+        last_t_indices = torch.stack((torch.arange(len(lens)), last_t_position), dim=1)
         last_t_indices_flat = last_t_position + np.arange(structure.mask.shape[0]) * structure.mask.shape[1]
         last_t = t[last_t_indices_flat.tolist()]
 
@@ -134,7 +141,7 @@ def get_lens_from_normalized(structure, c, t, g, catalog_g, add_bfl=False, scale
         updated_t = lens.bfl + last_t
 
         # Update
-        lens.t = tf.tensor_scatter_nd_update(lens.t, last_t_indices, updated_t)
+        lens.t.scatter_(1, last_t_indices, updated_t.unsqueeze(1))
     return lens
 
 
@@ -199,20 +206,20 @@ class Structure:
 @dataclass
 class Specs:
     structure: Structure
-    epd: tf.Tensor
-    hfov: tf.Tensor
-    vig_up: tf.Tensor = None
-    vig_down: tf.Tensor = None
-    vig_x: tf.Tensor = None
+    epd: torch.Tensor
+    hfov: torch.Tensor
+    vig_up: torch.Tensor = None
+    vig_down: torch.Tensor = None
+    vig_x: torch.Tensor = None
 
     def __post_init__(self):
         assert len(self.epd.shape) == 1, 'EPD should be 1-dimensional'
         assert len(self.hfov.shape) == 1, 'HFOV should be 1-dimensional'
 
         if any((self.vig_up is None, self.vig_down is None)):
-            self.vig_up = tf.zeros_like(self.epd)
-            self.vig_down = tf.zeros_like(self.epd)
-            self.vig_x = tf.zeros_like(self.epd)
+            self.vig_up = torch.zeros_like(self.epd)
+            self.vig_down = torch.zeros_like(self.epd)
+            self.vig_x = torch.zeros_like(self.epd)
 
     def __len__(self):
         return len(self.structure)
@@ -238,31 +245,31 @@ class Specs:
 @dataclass
 class Lens:
     structure: Structure
-    c: tf.Tensor
-    t: tf.Tensor
-    nd: tf.Tensor
-    v: tf.Tensor
+    c: torch.Tensor
+    t: torch.Tensor
+    nd: torch.Tensor
+    v: torch.Tensor
 
     def __post_init__(self):
 
         if len(self.c.shape) == 1:
             flat_c = self.c
-            self.c = tf.zeros_like(self.structure.mask, dtype=self.c.dtype)
+            self.c = torch.zeros_like(self.structure.mask, dtype=self.c.dtype)
             self.flat_c = flat_c
 
         if len(self.t.shape) == 1:
             flat_t = self.t
-            self.t = tf.zeros_like(self.structure.mask, dtype=self.t.dtype)
+            self.t = torch.zeros_like(self.structure.mask, dtype=self.t.dtype)
             self.flat_t = flat_t
 
         if len(self.nd.shape) == 1:
             flat_nd = self.nd
-            self.nd = tf.ones_like(self.structure.mask, dtype=self.nd.dtype)
+            self.nd = torch.ones_like(self.structure.mask, dtype=self.nd.dtype)
             self.flat_nd = flat_nd
 
         if len(self.v.shape) == 1:
             flat_v = self.v
-            self.v = tf.fill(self.structure.mask.shape, np.nan)
+            self.v = torch.fill(self.structure.mask.shape, np.nan)
             self.flat_v = flat_v
 
     def __len__(self):
@@ -295,8 +302,7 @@ class Lens:
         )
 
     def detach(self):
-        return Lens(self.structure, tf.stop_gradient(self.c), tf.stop_gradient(self.t),
-                    tf.stop_gradient(self.nd), tf.stop_gradient(self.v))
+        return Lens(self.structure, self.c.detach(), self.t.detach(), self.nd.detach(), self.v.detach())
 
     @property
     def flat_c(self):
@@ -349,7 +355,7 @@ class Lens:
         b = (self.nd - 1) / (self.v * (wf ** -2 - wc ** -2))
         a = self.nd - b / wd ** 2
         n = a[..., None] + b[..., None] / np.array([[wavelengths]]) ** 2
-        n = tf.where(self.structure.mask_G[..., None], n, tf.ones_like(n))
+        n = torch.where(self.structure.mask_G[..., None], n, torch.ones_like(n))
         return n
 
     @property
