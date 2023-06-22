@@ -1,33 +1,11 @@
-# The Differentiable Lens: Compound Lens Search over Glass Surfaces and Materials for Object Detection
+# TorchLens - Ray Tracing Library for PyTorch
 
+
+## This repository is a PyTorch implementation of the joint-lens-design repository by Côté, Mannan, et.al.
 ### [Paper](https://arxiv.org/abs/2212.04441) | [Project Page](https://light.princeton.edu/joint-lens-design)
-
+Authors of the original repository.
+https://github.com/gffrct/joint-lens-design.git
 #### Geoffroi Côté, Fahim Mannan, Simon Thibault, Jean-François Lalonde, Felix Heide
-
-This is the official code repository for the paper: "The Differentiable Lens: Compound Lens Search over Glass Surfaces and Materials for Object Detection", presented at CVPR 2023.
-
-![Lens Simulation Model](https://light.princeton.edu/joint-lens-design-simulation)
-
-This repository provides code to
-- model spherical lenses with arbitrary lens configurations based on their surface curvatures, spacings, and glass materials;
-- evaluate their performance using a differentiable implementation of exact ray tracing;
-- simulate physically accurate geometrical aberrations on input images that represent virtual scenes; and
-- optimize them either in isolation or alongside downstream vision tasks.
-
-In the CVPR 2023 work, this code was applied on object detection as a downstream computer vision task.
-
-If you find our work useful in your research, please cite:
-
-```
-@inproceedings{cote2023differentiable,
-  author = {C{\^o}t{\'e}, Geoffroi and Mannan, Fahim and Thibault, Simon and Lalonde, Jean-Fran{\c{c}}ois and Heide, Felix},
-  title = {The Differentiable Lens: Compound Lens Search over Glass Surfaces and Materials for Object Detection},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  month = {June},
-  year = {2023},
-  pages = {},
-}
-```
 
 ## Requirements
 
@@ -46,4 +24,4 @@ The sample script ```simulate_aberrations.py``` provides a simple demonstration 
 python simulate_aberrations --help
 ```
 
-For any question or advice, please reach out to me at gcote[at]princeton[dot]edu.
+For any question or advice, please reach out to me at haruka_takahira[at]keio[dot]jp.
